@@ -1,0 +1,24 @@
+services:
+  bot-alertas:
+    build: .
+    container_name: bot-alertas
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=Europe/Madrid                  # para que el resumen diario salga a tu hora
+      - WATCHDOG_SEGUNDOS=600             # si el bot no avanza en 10 min, se reinicia solo (0 = desactivado)
+    volumes:
+      - ./data:/data                                  # config.json, datos.db y estado
+      - ./bot_alertas.py:/app/bot_alertas.py:ro       # edita el script sin reconstruir
+      - ./healthcheck.py:/app/healthcheck.py:ro
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

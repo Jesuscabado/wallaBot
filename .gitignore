@@ -1,0 +1,24 @@
+# --- Secretos: NUNCA subir ---
+.env
+
+# --- Datos que se generan al ejecutar el bot ---
+data/
+config.json
+datos.db
+datos.db-journal
+estado.json
+health.json
+vistos.json
+vistos.json.migrado
+*.tmp
+
+# --- Python ---
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# --- Editor / sistema ---
+.vscode/
+.idea/
+.DS_Store
