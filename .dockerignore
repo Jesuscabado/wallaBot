@@ -1,7 +1,12 @@
 .git
+.github/
 .env
 data/
 venv/
 __pycache__/
 *.pyc
 *.md
+tests/
+pytest.ini
+requirements-dev.txt
+.pytest_cache/

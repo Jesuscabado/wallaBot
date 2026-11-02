@@ -1,2 +1,2 @@
-requests
-curl_cffi
+requests==2.34.2
+curl_cffi==0.16.3

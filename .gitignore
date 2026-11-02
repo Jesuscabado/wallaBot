@@ -22,3 +22,8 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+
+# --- Tests ---
+.pytest_cache/
+.coverage
+htmlcov/

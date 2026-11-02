@@ -69,6 +69,7 @@ VINTED_ENDPOINTS = [
 CONFIG_DEFECTO = {
     "intervalo_segundos": 180,
     "paginas_maximas": 3,
+    "max_avisos_por_busqueda": 8,
     "plataformas": ["wallapop", "vinted"],
     "ubicacion": {"latitud": 43.263, "longitud": -2.935},
     "alertas_salud": {"fallos_seguidos": 3, "latido_diario": True, "hora_latido": 9},
@@ -95,19 +96,37 @@ def cargar_config(anterior: dict | None = None) -> dict:
         return json.loads(json.dumps(CONFIG_DEFECTO))
     try:
         cfg = json.loads(ARCHIVO_CONFIG.read_text(encoding="utf-8"))
+        if not isinstance(cfg, dict):
+            raise ValueError("el archivo debe contener un objeto JSON { ... }")
     except (ValueError, OSError) as e:
         print(f"[config] config.json no es válido ({e}); sigo con la versión anterior")
         return anterior or json.loads(json.dumps(CONFIG_DEFECTO))
     res = json.loads(json.dumps(CONFIG_DEFECTO))
-    for k in ("intervalo_segundos", "paginas_maximas", "plataformas", "busquedas"):
+    for k in ("intervalo_segundos", "paginas_maximas", "max_avisos_por_busqueda", "plataformas", "busquedas"):
         if k in cfg:
             res[k] = cfg[k]
     for k in ("ubicacion", "alertas_salud", "horario_silencioso", "bajadas_precio", "chollos"):
-        res[k] = {**CONFIG_DEFECTO[k], **(cfg.get(k) or {})}
+        seccion = cfg.get(k)
+        res[k] = {**CONFIG_DEFECTO[k], **(seccion if isinstance(seccion, dict) else {})}
+    if not isinstance(res["plataformas"], list):
+        res["plataformas"] = CONFIG_DEFECTO["plataformas"]
+    try:
+        res["intervalo_segundos"] = int(float(res["intervalo_segundos"]))
+    except (TypeError, ValueError):
+        res["intervalo_segundos"] = CONFIG_DEFECTO["intervalo_segundos"]
+    brutas = res["busquedas"] if isinstance(res["busquedas"], list) else []
+    validas = [x for x in brutas if isinstance(x, dict) and isinstance(x.get("keyword"), str) and x["keyword"].strip()]
+    if len(validas) != len(brutas) or not isinstance(res["busquedas"], list):
+        print("[config] ignoro búsquedas no válidas (cada una debe ser un objeto con un 'keyword' de texto)")
+    res["busquedas"] = validas
     try:
         res["paginas_maximas"] = max(1, min(5, int(res["paginas_maximas"])))
     except (TypeError, ValueError):
         res["paginas_maximas"] = CONFIG_DEFECTO["paginas_maximas"]
+    try:
+        res["max_avisos_por_busqueda"] = max(0, min(50, int(res["max_avisos_por_busqueda"])))
+    except (TypeError, ValueError):
+        res["max_avisos_por_busqueda"] = CONFIG_DEFECTO["max_avisos_por_busqueda"]
     return res
 
 
@@ -135,8 +154,8 @@ def a_float(x):
         return None
 
 
-def resumen(resp) -> str:
-    cuerpo = (resp.text or "")[:150].replace("\n", " ")
+def resumen(resp, n: int = 150) -> str:
+    cuerpo = (resp.text or "")[:n].replace("\n", " ")
     return f"HTTP {resp.status_code}: {cuerpo}"
 
 
@@ -321,6 +340,17 @@ BUSCADORES = {"wallapop": buscar_wallapop, "vinted": buscar_vinted}
 # ------------------------------- FILTROS ---------------------------------
 
 
+def terminos_busqueda(b: dict) -> list[str]:
+    """La palabra clave y sus variantes (alias), sin repetidos ni vacíos."""
+    kw = b["keyword"]
+    vistos, res = {norm(kw)}, [kw]
+    for a in b.get("alias") or []:
+        if isinstance(a, str) and a.strip() and norm(a) not in vistos:
+            vistos.add(norm(a))
+            res.append(a.strip())
+    return res
+
+
 def pasa_filtros(item: dict, b: dict, con_precio: bool = True) -> bool:
     """Aplica precio mínimo/máximo (opcional), palabras excluidas y 'todas las palabras'."""
     precio = item["precio"]
@@ -331,7 +361,7 @@ def pasa_filtros(item: dict, b: dict, con_precio: bool = True) -> bool:
             return False
     titulo = norm(item["titulo"])
     if b.get("todas_las_palabras"):
-        if not all(p in titulo for p in norm(b["keyword"]).split()):
+        if not any(all(p in titulo for p in norm(t).split()) for t in terminos_busqueda(b)):
             return False
     for x in b.get("excluir") or []:
         if x.strip() and norm(x) in titulo:
@@ -355,7 +385,7 @@ def evaluar_salud(plataforma: str, ok: int, fallo: int, ultimo_error: str,
         if s["fallos"] >= umbral and not s["alertado"]:
             enviar_telegram(
                 f"⚠️ <b>{plataforma}</b> lleva {s['fallos']} ciclos seguidos fallando.\n"
-                f"Último error: {html.escape(ultimo_error[:300])}")
+                f"Último error: {html.escape(ultimo_error[:300])}\n\nMás detalle: /diagnostico")
             s["alertado"] = True
     elif ok:
         if s["alertado"]:
@@ -434,6 +464,8 @@ def migrar_vistos(db) -> None:
         return
     try:
         vistos = json.loads(ARCHIVO_VISTOS.read_text())
+        if not isinstance(vistos, dict):
+            raise ValueError("no es un objeto")
     except (OSError, ValueError) as e:
         print(f"[db] no pude leer vistos.json ({e}); lo ignoro")
         return
@@ -534,7 +566,8 @@ def conocido(db, id_: str, kw: str) -> bool:
     return db.execute("SELECT 1 FROM anuncios WHERE id=? AND busqueda=?", (id_, kw)).fetchone() is not None
 
 
-def obtener_resultados(plataforma: str, b: dict, cfg: dict, db, primera_vez: bool) -> tuple[list[dict], int]:
+def obtener_resultados(plataforma: str, b: dict, cfg: dict, db, primera_vez: bool,
+                       termino: str | None = None) -> tuple[list[dict], int]:
     """Descarga la primera página y solo pide más si TODA la anterior es desconocida.
 
     Si en la primera página ya hay anuncios que conocemos, no se ha escapado nada y no se pide más.
@@ -542,7 +575,8 @@ def obtener_resultados(plataforma: str, b: dict, cfg: dict, db, primera_vez: boo
     En la primera pasada de una búsqueda solo se descarga una página (basta con memorizar).
     """
     buscador = BUSCADORES[plataforma]
-    kw = b["keyword"]
+    kw = b["keyword"]               # identidad de la búsqueda (memoria y estadísticas)
+    consulta = termino or kw        # lo que se escribe en el buscador (clave o variante)
     try:
         limite = int(b.get("paginas_maximas", cfg["paginas_maximas"]))
     except (TypeError, ValueError):
@@ -553,8 +587,8 @@ def obtener_resultados(plataforma: str, b: dict, cfg: dict, db, primera_vez: boo
     cursor, paginas = None, 0
     while True:
         try:
-            res = buscador(kw, b.get("max_precio"), cfg) if cursor is None \
-                else buscador(kw, b.get("max_precio"), cfg, cursor)
+            res = buscador(consulta, b.get("max_precio"), cfg) if cursor is None \
+                else buscador(consulta, b.get("max_precio"), cfg, cursor)
         except Exception as e:
             if paginas == 0:
                 raise                      # la primera página sí cuenta como fallo de la búsqueda
@@ -573,6 +607,71 @@ def obtener_resultados(plataforma: str, b: dict, cfg: dict, db, primera_vez: boo
     return items, paginas
 
 
+def _prioridad(par: tuple) -> int:
+    """Chollos primero, luego bajadas de precio, luego el resto (en orden de aparición)."""
+    nota = par[1] or ""
+    return 0 if nota.startswith("🔥") else 1 if nota.startswith("📉") else 2
+
+
+def limite_avisos(cfg: dict, b: dict) -> int:
+    """Máximo de avisos individuales por búsqueda y ciclo (0 = sin límite)."""
+    try:
+        v = int(b.get("max_avisos", cfg["max_avisos_por_busqueda"]))
+    except (TypeError, ValueError):
+        v = cfg["max_avisos_por_busqueda"]
+    return max(0, min(50, v))
+
+
+def resumen_extras(kw: str, extras: list[tuple], limite: int) -> str:
+    """Un solo mensaje con los anuncios que no entraron en el límite."""
+    cabecera = (f"📦 <b>+{len(extras)} anuncios más</b> de «{html.escape(kw)}» "
+                f"(límite: {limite} avisos por ciclo)\n")
+    cuerpo, usados = "", 0
+    for it, nota in extras[:25]:
+        precio = f"{it['precio']:g} €" if it["precio"] is not None else "s/p"
+        marca = "🔥 " if (nota or "").startswith("🔥") else "📉 " if (nota or "").startswith("📉") else ""
+        linea = f"\n{marca}<b>{it['plataforma']}</b> · {html.escape(it['titulo'][:100])} · {precio}\n{it['url']}\n"
+        if len(cabecera) + len(cuerpo) + len(linea) > 3500:
+            break
+        cuerpo += linea
+        usados += 1
+    if usados < len(extras):
+        cuerpo += (f"\n… y {len(extras) - usados} más. Afina la búsqueda (/excluir, /maximo) "
+                   "o sube el límite con /limite.")
+    return cabecera + cuerpo
+
+
+def despachar_avisos(cfg: dict, estado: dict, b: dict, kw: str, avisar: list[tuple]) -> None:
+    """Envía los avisos de una búsqueda aplicando el límite por ciclo.
+
+    Los `limite` más interesantes (chollos, bajadas, luego los más recientes) van sueltos; el resto,
+    en un mensaje resumen que se manda antes, para que lo mejor quede al final del chat.
+    Durante una pausa u horario silencioso todo se guarda para el resumen posterior (sin límite aquí).
+    """
+    if not avisar:
+        return
+    if silenciado(cfg, estado):
+        with LOCK:
+            pend = estado.setdefault("pendientes", [])
+            for it, nota in reversed(avisar):
+                pend.append({"plataforma": it["plataforma"], "titulo": it["titulo"],
+                             "precio": it["precio"], "url": it["url"], "kw": kw, "nota": nota})
+            del pend[:-MAX_PENDIENTES]
+            guardar_estado_persistente(estado)
+        return
+
+    limite = limite_avisos(cfg, b)
+    ordenados = sorted(avisar, key=_prioridad)          # estable: dentro de cada grupo, lo más nuevo primero
+    elegidos, resto = (ordenados[:limite], ordenados[limite:]) if limite else (ordenados, [])
+    if resto and enviar_telegram(resumen_extras(kw, resto, limite), preview=False):
+        estado["avisos"] += len(resto)
+        time.sleep(1)
+    for it, nota in reversed(elegidos):                 # lo mejor, lo último (abajo del todo en el chat)
+        if enviar_telegram(formatear(it, kw, nota), it["foto"]):
+            estado["avisos"] += 1
+        time.sleep(1)
+
+
 def ciclo(cfg: dict, db, estado: dict) -> None:
     enviar_pendientes_si_toca(cfg, estado)
     for plataforma in cfg["plataformas"]:
@@ -589,31 +688,37 @@ def ciclo(cfg: dict, db, estado: dict) -> None:
         for b in cfg["busquedas"]:
             kw = b["keyword"]
             estado["pulso"] = time.time()
-            primera_vez = not hay_marca(db, plataforma, kw)   # primera pasada: solo memorizar
-            try:
-                items, paginas = obtener_resultados(plataforma, b, cfg, db, primera_vez)
-            except Exception as e:
+            terminos = terminos_busqueda(b)
+            items, avisar, nuevos, paginas, primera_vez = [], [], 0, 0, False
+            exito, error_busqueda = False, None
+            for termino in terminos:
+                # cada variante tiene su propia "primera pasada silenciosa", pero comparte memoria
+                clave_marca = kw if termino == kw else f"{kw}|alias:{termino}"
+                primera_t = not hay_marca(db, plataforma, clave_marca)
+                try:
+                    items_t, pag_t = obtener_resultados(plataforma, b, cfg, db, primera_t, termino)
+                except Exception as e:
+                    error_busqueda = e
+                    print(f"[{plataforma}] error buscando '{termino}': {e}")
+                    continue
+                exito = True
+                av_t, nuevos_t = procesar_resultados(db, cfg, b, plataforma, items_t, primera_t)
+                poner_marca(db, plataforma, clave_marca)
+                items += items_t
+                avisar += av_t
+                nuevos += nuevos_t
+                paginas += pag_t
+                primera_vez = primera_vez or primera_t
+                if len(terminos) > 1:
+                    time.sleep(2)
+            if not exito:            # solo cuenta como fallo si fallan TODOS los términos
                 fallo += 1
-                ultimo_error = str(e)
-                print(f"[{plataforma}] error buscando '{kw}': {e}")
+                ultimo_error = str(error_busqueda)
                 continue
             ok += 1
+            items = list({i["id"]: i for i in items}.values())   # sin repetidos entre variantes
 
-            avisar, nuevos = procesar_resultados(db, cfg, b, plataforma, items, primera_vez)
-            poner_marca(db, plataforma, kw)
-
-            for it, nota in reversed(avisar):   # del más antiguo al más nuevo
-                if silenciado(cfg, estado):     # pausa u horario silencioso: se guarda para luego
-                    with LOCK:
-                        pend = estado.setdefault("pendientes", [])
-                        pend.append({"plataforma": it["plataforma"], "titulo": it["titulo"],
-                                     "precio": it["precio"], "url": it["url"], "kw": kw, "nota": nota})
-                        del pend[:-MAX_PENDIENTES]
-                        guardar_estado_persistente(estado)
-                else:
-                    if enviar_telegram(formatear(it, kw, nota), it["foto"]):
-                        estado["avisos"] += 1
-                    time.sleep(1)
+            despachar_avisos(cfg, estado, b, kw, avisar)
 
             print(f"[{plataforma}] '{kw}': {len(items)} resultados ({paginas} pág.), {nuevos} nuevos, "
                   f"{len(avisar)} avisos{' (memorizando)' if primera_vez else ''}")
@@ -635,6 +740,8 @@ MAX_PENDIENTES = 200
 def cargar_estado_persistente() -> dict:
     try:
         d = json.loads(ARCHIVO_ESTADO.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            raise ValueError("estado.json no es un objeto")
         return {"silencio_hasta": float(d.get("silencio_hasta", 0)),
                 "pendientes": list(d.get("pendientes", []))}
     except (OSError, ValueError, TypeError):
@@ -696,12 +803,16 @@ class ConfigError(Exception):
     pass
 
 
+MAX_ALIAS = 3   # variantes por búsqueda: cada una es una petición más
+
+
 AYUDA = (
     "🤖 <b>Comandos</b>\n"
     "/lista — ver tus búsquedas\n"
     "/anadir zelda minish cap 30 — nueva búsqueda (el último número es el precio máximo; "
     "si el nombre acaba en número y no quieres máximo, termina con «sin»)\n"
     "/quitar 2 — borrar la búsqueda nº 2\n"
+    "/alias 3 gamecube — que la búsqueda 3 busque también «gamecube» y lo junte todo (/quitaralias 3 gamecube)\n"
     "/maximo 2 40 — precio máximo («sin» para quitarlo)\n"
     "/minimo 2 5 — precio mínimo («sin» para quitarlo)\n"
     "/excluir 2 funda — descartar anuncios con esa palabra o frase\n"
@@ -713,18 +824,22 @@ AYUDA = (
     "/chollos 25 — marcar como chollo lo que esté ≥25% por debajo de la mediana (off / on; por búsqueda: /chollos 2 25)\n"
     "/bajadas 15 — avisar si un anuncio que ya conocía baja ≥15% (off / on)\n"
     "/paginas 3 — hasta cuántas páginas de resultados revisa por búsqueda (por búsqueda: /paginas 2 4)\n"
+    "/limite 8 — máximo de avisos sueltos por búsqueda y ciclo; el resto, en un mensaje resumen (0 = sin límite; por búsqueda: /limite 2 5)\n"
+    "/diagnostico — prueba Wallapop y Vinted y te dice qué falla\n"
     "/estado — resumen del bot\n\n"
     "Lo que salga durante una pausa o el horario silencioso se guarda y te llega junto al terminar."
 )
 
 MENU = [
     ("lista", "Ver mis búsquedas"), ("anadir", "Añadir búsqueda: /anadir palabras [precio]"),
-    ("quitar", "Quitar una búsqueda por número"), ("maximo", "Fijar precio máximo"),
+    ("quitar", "Quitar una búsqueda por número"), ("alias", "Añadir una variante a una búsqueda"),
+    ("quitaralias", "Quitar una variante"), ("maximo", "Fijar precio máximo"),
     ("minimo", "Fijar precio mínimo"), ("excluir", "Excluir una palabra de una búsqueda"),
     ("permitir", "Quitar una exclusión"), ("pausa", "Pausar avisos [horas]"),
     ("reanudar", "Reanudar avisos"), ("silencio", "Horario silencioso: /silencio 1-8"),
     ("precios", "Precio habitual de una búsqueda"), ("chollos", "Detector de chollos"),
-    ("bajadas", "Avisos de bajada de precio"), ("paginas", "Páginas de resultados a revisar"),
+    ("bajadas", "Avisos de bajada de precio"), ("paginas", "Páginas de resultados a revisar"), ("limite", "Máximo de avisos sueltos por ciclo"),
+    ("diagnostico", "Probar las plataformas y ver qué falla"),
     ("estado", "Estado del bot"), ("ayuda", "Ayuda"),
 ]
 
@@ -734,7 +849,10 @@ def leer_raw() -> dict:
     if not ARCHIVO_CONFIG.exists():
         return json.loads(json.dumps(CONFIG_DEFECTO))
     try:
-        return json.loads(ARCHIVO_CONFIG.read_text(encoding="utf-8"))
+        raw = json.loads(ARCHIVO_CONFIG.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("debe contener un objeto JSON { ... }")
+        return raw
     except ValueError as e:
         raise ConfigError(f"config.json tiene un error de sintaxis ({html.escape(str(e))}). "
                           "Arréglalo en el archivo y vuelve a intentarlo.")
@@ -781,6 +899,8 @@ def _texto_busqueda(i: int, b: dict) -> str:
         partes.append(f"máx {b['max_precio']:g} €")
     if b.get("min_precio") is not None:
         partes.append(f"mín {b['min_precio']:g} €")
+    if b.get("alias"):
+        partes.append("también: " + ", ".join(b["alias"]))
     if b.get("excluir"):
         partes.append("sin: " + ", ".join(b["excluir"]))
     if b.get("todas_las_palabras"):
@@ -819,8 +939,13 @@ def _comando(cmd: str, args: list[str], estado: dict) -> str:
         guardar_raw(raw)
         DESPERTAR.set()
         tope = f" (máx {maximo:g} €)" if maximo is not None else ""
+        palabras, consejo = kw.split(), ""
+        if len(palabras) == 2:
+            unida = html.escape("".join(palabras))
+            consejo = f"\n💡 ¿Quieres que busque también «{unida}» todo junto? /alias {len(bs)} {unida}"
         return (f"✅ Añadida: <b>{html.escape(kw)}</b>{tope}\n"
-                "La primera pasada solo memoriza lo que ya existe; te aviso de lo que salga a partir de ahora.")
+                "La primera pasada solo memoriza lo que ya existe; te aviso de lo que salga a partir de ahora."
+                + consejo)
 
     if cmd in ("quitar", "maximo", "minimo", "excluir", "permitir"):
         raw = leer_raw()
@@ -978,6 +1103,66 @@ def _comando(cmd: str, args: list[str], estado: dict) -> str:
                 txt += f" (aún no se usa: hacen falta {cfg['chollos']['min_muestras']} anuncios)"
         return txt
 
+    if cmd in ("alias", "quitaralias"):
+        raw = leer_raw()
+        bs = raw.get("busquedas", [])
+        b = bs[_indice(args[0] if args else None, len(bs))]
+        frase = " ".join(args[1:]).strip()[:80]
+        if not frase:
+            raise ConfigError(f"Uso: /{cmd} número palabra (por ejemplo /{cmd} 3 gamecube)")
+        nombre = html.escape(b["keyword"])
+        lista = list(b.get("alias") or [])
+        if cmd == "alias":
+            if norm(frase) == norm(b["keyword"]) or norm(frase) in [norm(x) for x in lista]:
+                raise ConfigError(f"«{html.escape(frase)}» ya está en esa búsqueda.")
+            if len(lista) >= MAX_ALIAS:
+                raise ConfigError(f"Máximo {MAX_ALIAS} variantes por búsqueda (cada una es una petición más).")
+            b["alias"] = lista + [frase]
+            guardar_raw(raw)
+            DESPERTAR.set()
+            return (f"✅ <b>{nombre}</b>: ahora también busco «{html.escape(frase)}» y lo junto todo en una "
+                    "sola búsqueda. La primera pasada de la variante solo memoriza lo que ya existe.")
+        nueva = [x for x in lista if norm(x) != norm(frase)]
+        if len(nueva) == len(lista):
+            raise ConfigError(f"«{html.escape(frase)}» no es una variante de esa búsqueda.")
+        if nueva:
+            b["alias"] = nueva
+        else:
+            b.pop("alias", None)
+        guardar_raw(raw)
+        return f"✅ <b>{nombre}</b>: ya no busco «{html.escape(frase)}»."
+
+    if cmd == "limite":
+        raw = leer_raw()
+
+        def _num(a: str) -> int:
+            if not a.isdigit() or not 0 <= int(a) <= 50:
+                raise ConfigError(f"«{html.escape(a)}» no vale: indica un número del 0 al 50 (0 = sin límite).")
+            return int(a)
+
+        if not args:
+            n = cargar_config()["max_avisos_por_busqueda"]
+            actual = f"{n} avisos" if n else "sin límite"
+            return (f"📦 Límite: {actual} individuales por búsqueda y ciclo. Si hay más, los mejores llegan sueltos "
+                    "(chollos y bajadas primero) y el resto en un solo mensaje resumen.\n"
+                    "Cambiar: /limite 8 · /limite 0 (sin límite) · por búsqueda: /limite 2 5 · /limite 2 auto")
+        if len(args) == 1:
+            raw["max_avisos_por_busqueda"] = _num(args[0])
+            guardar_raw(raw)
+            n = raw["max_avisos_por_busqueda"]
+            return f"📦 Límite de avisos por búsqueda y ciclo: {n if n else 'sin límite'}."
+        bs = raw.get("busquedas", [])
+        b = bs[_indice(args[0], len(bs))]
+        if norm(args[1]) == "auto":
+            b.pop("max_avisos", None)
+            msg = f"📦 <b>{html.escape(b['keyword'])}</b>: vuelve al límite global."
+        else:
+            b["max_avisos"] = _num(args[1])
+            msg = (f"📦 <b>{html.escape(b['keyword'])}</b>: "
+                   f"{'hasta ' + str(b['max_avisos']) + ' avisos por ciclo' if b['max_avisos'] else 'sin límite'}.")
+        guardar_raw(raw)
+        return msg
+
     if cmd == "paginas":
         raw = leer_raw()
 
@@ -1019,6 +1204,8 @@ def _comando(cmd: str, args: list[str], estado: dict) -> str:
             lineas.append(f"🌙 Horario silencioso {hs['desde']}:00–{hs['hasta']}:00")
         if estado.get("pendientes"):
             lineas.append(f"📬 {len(estado['pendientes'])} anuncios guardados para enviar")
+        lineas.append("🌐 Aviso externo de caída: " +
+                      ("activado" if os.environ.get("HEALTHCHECK_URL", "").strip() else "no configurado"))
         return "\n".join(lineas)
 
     return "No conozco ese comando. Escribe /ayuda."
@@ -1030,6 +1217,11 @@ def ejecutar_comando(texto: str, estado: dict) -> str | None:
     if not partes or not partes[0].startswith("/"):
         return None
     cmd = norm(partes[0][1:].split("@")[0])   # sin @NombreDelBot ni tildes (/añadir = /anadir)
+    if cmd == "diagnostico":   # hace peticiones de red: no debe retener LOCK mientras tanto
+        try:
+            return _comando_diagnostico()
+        except Exception as e:
+            return f"⚠️ Error ejecutando el diagnóstico: {html.escape(str(e))}"
     try:
         with LOCK:
             return _comando(cmd, partes[1:], estado)
@@ -1081,76 +1273,196 @@ def escuchar_comandos(estado: dict) -> None:
 ARCHIVO_SALUD = Path("health.json")
 
 
-def vigilante(estado: dict, limite: float | None = None, pausa: float = 30, salir=os._exit) -> None:
+def ping_externo(url: str) -> bool:
+    """Avisa a un servicio externo (healthchecks.io) de que el bot sigue vivo."""
+    try:
+        return requests.get(url, timeout=10).ok
+    except requests.RequestException as e:
+        # solo el tipo de error: el mensaje completo incluiría la URL, que es secreta
+        print(f"[ping] no se pudo avisar al servicio externo ({type(e).__name__})")
+        return False
+
+
+def vigilante(estado: dict, limite: float | None = None, pausa: float = 30, salir=os._exit,
+              ping=None, cada: float | None = None) -> None:
     """Hilo que reinicia el bot si se queda atascado y escribe health.json para el healthcheck.
 
     `estado["pulso"]` se actualiza con cada avance (cada búsqueda, cada ciclo). Durante la espera entre
     ciclos apunta al futuro, así que esperar no cuenta como atasco. Si pasan más de `limite` segundos
     sin avance, el proceso termina con error y Docker (restart) o systemd lo vuelven a lanzar.
     Desactivar con WATCHDOG_SEGUNDOS=0.
+
+    Si existe HEALTHCHECK_URL (healthchecks.io), hace ping cada `cada` segundos (por defecto 300)
+    mientras el bot avanza con normalidad. Si los pings dejan de llegar, el servicio te avisa: cubre
+    el caso de PC apagado o sin internet, cuando el bot no puede avisarte él mismo por Telegram.
+    Antes de reiniciarse por un atasco envía /fail para que el aviso llegue enseguida.
     """
     if limite is None:
         try:
             limite = float(os.environ.get("WATCHDOG_SEGUNDOS", "600"))
         except ValueError:
             limite = 600.0
+    ping = ping or ping_externo
+    url = os.environ.get("HEALTHCHECK_URL", "").strip()
+    if cada is None:
+        try:
+            cada = float(os.environ.get("HEALTHCHECK_CADA", "300"))
+        except ValueError:
+            cada = 300.0
+    ultimo_ping = 0.0
     while not estado.get("_parar"):
         time.sleep(pausa)
         sin_avance = time.time() - estado.get("pulso", time.time())
         if limite > 0 and sin_avance > limite:
             print(f"[vigilante] sin avances desde hace {int(sin_avance)} s: reinicio el proceso")
             enviar_telegram(f"⚠️ El bot llevaba {int(sin_avance // 60)} min atascado. Lo reinicio.")
+            if url:
+                ping(url.rstrip("/") + "/fail")
             salir(1)
             return
         try:
             ARCHIVO_SALUD.write_text(json.dumps({"t": time.time()}))
         except OSError:
             pass
+        if url and time.time() - ultimo_ping >= cada:
+            # si el ping falla se reintenta al minuto, no a los 5
+            ultimo_ping = time.time() if ping(url) else time.time() - cada + 60
+
+
+_diag_lock = threading.Lock()   # solo un diagnóstico a la vez
+
+
+def _veredicto(res: list[tuple]) -> str:
+    """res: [(código HTTP o None, nº de anuncios o None)] de cada endpoint probado."""
+    if any(c == 200 and n for c, n in res):
+        return f"✅ funciona ({max(n for c, n in res if c == 200 and n)} resultados)"
+    if any(c == 200 for c, _ in res):
+        return "⚠️ responde pero sin resultados (¿ha cambiado el formato?)"
+    codigos = [c for c, _ in res if c]
+    if 403 in codigos:
+        return "🚫 bloqueado o endpoint retirado (403)"
+    if 429 in codigos:
+        return "⏳ demasiadas peticiones (429): espera y no bajes el intervalo"
+    if 404 in codigos:
+        return "❓ ruta no encontrada (404): el endpoint ha cambiado"
+    if not codigos:
+        return "🔌 sin respuesta (conexión o tiempo agotado)"
+    return f"❌ respuesta inesperada ({codigos[0]})"
+
+
+def _linea_http(r, n: int) -> str:
+    return f"HTTP {r.status_code}" if r.status_code == 200 else resumen(r, n)
+
+
+def informe_diagnostico(cfg: dict, n: int = 150) -> dict:
+    """Prueba cada endpoint de las plataformas configuradas.
+
+    Devuelve {"veredictos": {plataforma: texto}, "detalle": [líneas], "cffi": bool}.
+    `n` es cuánto del cuerpo de una respuesta de error se enseña.
+    """
+    kw = cfg["busquedas"][0]["keyword"] if cfg.get("busquedas") else "nintendo"
+    plataformas = cfg.get("plataformas") or []
+    detalle: list[str] = []
+    veredictos: dict[str, str] = {}
+
+    if "wallapop" in plataformas:
+        detalle.append("== WALLAPOP ==")
+        res = []
+        s = nueva_sesion()
+        params = {"keywords": kw, "order_by": "newest", "source": "search_box",
+                  "latitude": cfg["ubicacion"]["latitud"], "longitude": cfg["ubicacion"]["longitud"],
+                  "language": "es_ES"}
+        cabeceras = {"Accept": "application/json", "X-DeviceOS": "0",
+                     "Origin": "https://es.wallapop.com", "Referer": "https://es.wallapop.com/"}
+        for url in WALLAPOP_ENDPOINTS:
+            try:
+                r = s.get(url, params=params, headers=cabeceras, timeout=20)
+                nitems = None
+                if r.status_code == 200:
+                    try:
+                        datos = r.json().get("data", {})
+                        nitems = len((datos.get("section") or {}).get("payload", {}).get("items")
+                                     or datos.get("search_objects") or datos.get("items") or [])
+                    except ValueError:
+                        nitems = 0
+                res.append((r.status_code, nitems))
+                detalle.append(f"{url}\n   {_linea_http(r, n)}" +
+                               (f" · anuncios: {nitems}" if nitems is not None else ""))
+            except Exception as e:
+                res.append((None, None))
+                detalle.append(f"{url}\n   EXCEPCIÓN {type(e).__name__}: {str(e)[:n]}")
+        veredictos["Wallapop"] = _veredicto(res)
+
+    if "vinted" in plataformas:
+        detalle += ["", "== VINTED =="] if detalle else ["== VINTED =="]
+        res = []
+        try:
+            s = nueva_sesion()
+            r = s.get(VINTED_DOMINIO, headers={"Accept-Language": "es-ES,es;q=0.9"}, timeout=20)
+            detalle.append(f"home: {_linea_http(r, n)}")
+            try:
+                detalle.append(f"cookies recibidas: {list(s.cookies.keys())}")   # solo los nombres
+            except Exception:
+                pass
+            for url in VINTED_ENDPOINTS:
+                try:
+                    r = s.get(url, params=_params_vinted(kw, None), headers=_headers_vinted(), timeout=20)
+                    nitems, extra = None, ""
+                    if r.status_code == 200:
+                        try:
+                            j = r.json()
+                            its = j.get("items") or (j.get("data") or {}).get("items") or []
+                            nitems = len(its)
+                            extra = f"\n   claves JSON: {list(j.keys())}"
+                            if its:
+                                extra += f"\n   campos de un anuncio: {list(its[0].keys())}"
+                        except ValueError:
+                            nitems, extra = 0, "\n   (la respuesta no es JSON)"
+                    res.append((r.status_code, nitems))
+                    detalle.append(f"{url}\n   {_linea_http(r, n)}" +
+                                   (f" · anuncios: {nitems}" if nitems is not None else "") + extra)
+                except Exception as e:
+                    res.append((None, None))
+                    detalle.append(f"{url}\n   EXCEPCIÓN {type(e).__name__}: {str(e)[:n]}")
+        except Exception as e:
+            res.append((None, None))
+            detalle.append(f"EXCEPCIÓN {type(e).__name__}: {str(e)[:n]}")
+        veredictos["Vinted"] = _veredicto(res)
+
+    return {"veredictos": veredictos, "detalle": detalle, "cffi": HAY_CFFI}
 
 
 def diagnostico() -> None:
-    cfg = cargar_config()
-    print(f"curl_cffi instalado: {HAY_CFFI}\n")
-    kw = cfg["busquedas"][0]["keyword"]
+    """Versión para terminal: python bot_alertas.py --diagnostico"""
+    inf = informe_diagnostico(cargar_config())
+    print(f"curl_cffi instalado: {inf['cffi']}\n")
+    for plataforma, texto in inf["veredictos"].items():
+        print(f"{plataforma}: {texto}")
+    print("\n" + "\n".join(inf["detalle"]))
 
-    print("== WALLAPOP ==")
-    s = nueva_sesion()
-    params = {"keywords": kw, "order_by": "newest", "source": "search_box",
-              "latitude": cfg["ubicacion"]["latitud"],
-              "longitude": cfg["ubicacion"]["longitud"], "language": "es_ES"}
-    for url in WALLAPOP_ENDPOINTS:
-        try:
-            r = s.get(url, params=params, headers={"Accept": "application/json",
-                      "X-DeviceOS": "0", "Origin": "https://es.wallapop.com",
-                      "Referer": "https://es.wallapop.com/"}, timeout=20)
-            print(f"{url}\n   {resumen(r)}")
-        except Exception as e:
-            print(f"{url}\n   EXCEPCIÓN: {e}")
 
-    print("\n== VINTED ==")
+def _recortar_html(texto: str, limite: int) -> str:
+    """Escapa para HTML de Telegram y recorta el texto ANTES de escapar (para no partir una entidad)."""
+    while len(html.escape(texto)) > limite and texto:
+        texto = texto[: int(len(texto) * 0.8)]
+    return html.escape(texto)
+
+
+def _comando_diagnostico() -> str:
+    if not _diag_lock.acquire(blocking=False):
+        return "⏳ Ya hay un diagnóstico en marcha. Espera a que termine."
     try:
-        s = nueva_sesion()
-        r = s.get(VINTED_DOMINIO, headers={"Accept-Language": "es-ES,es;q=0.9"}, timeout=20)
-        print(f"home: {resumen(r)}")
-        try:
-            print(f"cookies recibidas: {list(s.cookies.keys())}")
-        except Exception:
-            pass
-        for url in VINTED_ENDPOINTS:
-            try:
-                r = s.get(url, params=_params_vinted(kw, None),
-                          headers=_headers_vinted(), timeout=20)
-                print(f"{url}\n   {resumen(r)}")
-                if r.status_code == 200:
-                    j = r.json()
-                    its = j.get("items") or (j.get("data") or {}).get("items") or []
-                    print(f"   claves JSON: {list(j.keys())} · nº items: {len(its)}")
-                    if its:
-                        print(f"   claves del 1er item: {list(its[0].keys())}")
-            except Exception as e:
-                print(f"{url}\n   EXCEPCIÓN: {e}")
-    except Exception as e:
-        print(f"EXCEPCIÓN: {e}")
+        enviar_telegram("🔍 Ejecutando diagnóstico… puede tardar hasta un minuto.", preview=False)
+        inf = informe_diagnostico(cargar_config(), n=80)
+        lineas = ["🔍 <b>Diagnóstico</b>"]
+        lineas += [f"{p}: {html.escape(v)}" for p, v in inf["veredictos"].items()]
+        lineas.append("curl_cffi: " + ("sí" if inf["cffi"] else "NO (sin él es probable que den 403/404)"))
+        detalle = "\n".join(inf["detalle"])
+        if len(detalle) > 1500:
+            detalle = detalle[:1500] + "…"
+        return "\n".join(lineas) + f"\n\n<pre>{_recortar_html(detalle, 2500)}</pre>"
+    finally:
+        _diag_lock.release()
 
 
 def main() -> None:
@@ -1172,11 +1484,21 @@ def main() -> None:
     enviar_telegram("✅ Bot de alertas iniciado. Escribe /ayuda para ver los comandos.")
     estado["pulso"] = time.time()
     threading.Thread(target=escuchar_comandos, args=(estado,), daemon=True).start()
+    if os.environ.get("HEALTHCHECK_URL", "").strip():
+        print("[ping] aviso externo de caída activado")
     threading.Thread(target=vigilante, args=(estado,), daemon=True).start()
 
     while True:
         cfg = cargar_config(cfg)   # relee config.json: los cambios se aplican sin reiniciar
-        ciclo(cfg, db, estado)
+        try:
+            ciclo(cfg, db, estado)
+            estado["errores_seguidos"] = 0
+        except Exception as e:   # un fallo inesperado no debe tumbar el bot
+            estado["errores_seguidos"] = estado.get("errores_seguidos", 0) + 1
+            print(f"[ciclo] error inesperado ({estado['errores_seguidos']} seguidos): {e!r}")
+            if estado["errores_seguidos"] == 3:
+                enviar_telegram("⚠️ El bot no consigue completar los ciclos por un error interno.\n"
+                                f"Último error: {html.escape(repr(e)[:300])}\n\nRevisa los logs del contenedor.")
         estado["ciclos"] += 1
         if estado["ciclos"] % 480 == 0:   # más o menos una vez al día
             limpiar_db(db)

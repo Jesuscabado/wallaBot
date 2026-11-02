@@ -1,0 +1,38 @@
+{
+  "intervalo_segundos": 180,
+  "paginas_maximas": 3,
+  "max_avisos_por_busqueda": 8,
+  "plataformas": [
+    "wallapop",
+    "vinted"
+  ],
+  "ubicacion": {
+    "latitud": 40.4168,
+    "longitud": -3.7038
+  },
+  "alertas_salud": {
+    "fallos_seguidos": 3,
+    "latido_diario": true,
+    "hora_latido": 9
+  },
+  "horario_silencioso": {
+    "activo": false,
+    "desde": 1,
+    "hasta": 8
+  },
+  "bajadas_precio": {
+    "activo": true,
+    "min_porcentaje": 10,
+    "min_euros": 2
+  },
+  "chollos": {
+    "activo": true,
+    "porcentaje": 30,
+    "min_muestras": 15,
+    "dias": 60
+  },
+  "busquedas": [
+    {"keyword": "game boy advance", "min_precio": null, "max_precio": 60, "excluir": [ "funda", "caja vacia" ], "todas_las_palabras": false, "alias": [ "gameboy advance" ]},
+    {"keyword": "nintendo ds lite", "min_precio": 10, "max_precio": 80, "excluir": [], "todas_las_palabras": true}
+  ]
+}
